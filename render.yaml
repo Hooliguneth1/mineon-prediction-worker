@@ -1,0 +1,6 @@
+services:
+  - type: worker
+    name: mineon-prediction-worker
+    env: node
+    buildCommand: npm ci && npx prisma generate && npm run build
+    startCommand: npm run start
