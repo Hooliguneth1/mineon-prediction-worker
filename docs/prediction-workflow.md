@@ -18,7 +18,7 @@ This document describes how prediction rounds progress so the UI can stay in syn
 
 - `BETTING -> LIVE` when `now >= lockAt - 300ms` (`transitionToleranceMs`).
 - `LIVE -> CLOSED` when `now >= endsAt - 300ms`.
-- Worker checks/transitions in a loop every `0.5s` (`loopIntervalMs`).
+- Worker checks/transitions in a loop every `2s` (`loopIntervalMs`).
 
 ## 2) Timestamps and durations
 
@@ -43,7 +43,7 @@ Bet acceptance cutoff uses a small safety buffer:
 ## 3) Ticks
 
 - Ticks are written by the worker during `BETTING` and `LIVE`.
-- In practice, worker attempts tick insert roughly every loop (`~0.5s`).
+- In practice, worker attempts tick insert roughly every loop (`~2s`).
 - A seed tick (`index=0`) is inserted when the round opens if a snapshot is available.
 - A final tick is attempted before close.
 
@@ -91,5 +91,5 @@ If worker is paused/stopped, tick writing stops.
 
 - Active round: `status in [BETTING, LIVE]`
 - Lock betting slightly before lock (`~500ms` buffer)
-- Expect transition timing granularity around worker loop (`~0.5s`) plus tolerance (`300ms`)
+- Expect transition timing granularity around worker loop (`~2s`) plus tolerance (`300ms`)
 - Finished/settled round: `status=CLOSED && settled=true`
