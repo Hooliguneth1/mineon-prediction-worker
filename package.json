@@ -1,0 +1,36 @@
+{
+  "name": "mineon-prediction-worker",
+  "version": "1.0.0",
+  "description": "Standalone exchange-price prediction round worker",
+  "type": "commonjs",
+  "main": "dist/worker.js",
+  "scripts": {
+    "dev": "tsx src/worker.ts",
+    "build": "tsc --project tsconfig.json",
+    "start": "node dist/worker.js",
+    "test": "tsx --test src/**/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "loadtest:phase1": "tsx scripts/phase1-synthetic-10k.ts",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate deploy"
+  },
+  "keywords": [
+    "worker",
+    "binance",
+    "prisma",
+    "prediction"
+  ],
+  "license": "ISC",
+  "dependencies": {
+    "@prisma/client": "^6.19.2",
+    "dotenv": "^17.3.1",
+    "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.2",
+    "@types/ws": "^8.18.1",
+    "prisma": "^6.19.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}

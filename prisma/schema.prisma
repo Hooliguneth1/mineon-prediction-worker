@@ -1,0 +1,391 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Boost {
+  id               String             @id
+  name             String
+  description      String
+  hashrateBonus    Decimal            @db.Decimal(18, 8)
+  price            Decimal            @db.Decimal(18, 8)
+  currency         String             @default("TOKEN")
+  duration         Int?
+  supplyLimit      Int?
+  totalSold        Int                @default(0)
+  createdAt        DateTime           @default(now())
+  isPermanent      Boolean            @default(true)
+  isTradable       Boolean            @default(true)
+  priceLamports    BigInt?            @default(0)
+  multiplier       Decimal?           @db.Decimal(18, 8)
+  priceSol         Decimal?           @db.Decimal(18, 8)
+  priceUSD         Decimal?           @db.Decimal(10, 2)
+  unlockTier       Int                @default(1)
+  BoostMarketplace BoostMarketplace[]
+  UserBoost        UserBoost[]
+}
+
+model BoostMarketplace {
+  id                                   String            @id
+  sellerId                             String
+  boostId                              String
+  userBoostId                          String
+  price                                Decimal           @db.Decimal(18, 8)
+  status                               MarketplaceStatus @default(ACTIVE)
+  buyerId                              String?
+  createdAt                            DateTime          @default(now())
+  soldAt                               DateTime?
+  cancelledAt                          DateTime?
+  priceSol                             Decimal?          @db.Decimal(18, 9)
+  commissionSol                        Decimal?          @db.Decimal(18, 9)
+  Boost                                Boost             @relation(fields: [boostId], references: [id])
+  User_BoostMarketplace_buyerIdToUser  User?             @relation("BoostMarketplace_buyerIdToUser", fields: [buyerId], references: [id])
+  User_BoostMarketplace_sellerIdToUser User              @relation("BoostMarketplace_sellerIdToUser", fields: [sellerId], references: [id])
+  MarketplaceBid                       MarketplaceBid[]
+
+  @@index([buyerId])
+  @@index([sellerId])
+  @@index([status])
+}
+
+model GlobalMiningState {
+  id                            String    @id @default("singleton")
+  totalMined                    Decimal   @default(0) @db.Decimal(18, 8)
+  emissionRatePerSecond         Decimal   @default(100) @db.Decimal(18, 8)
+  currentHalvingPhase           Int       @default(1)
+  nextHalvingAt                 Decimal   @default(20000000) @db.Decimal(18, 8)
+  halvingInterval               Decimal   @default(20000000) @db.Decimal(18, 8)
+  lastUpdateAt                  DateTime  @default(now())
+  totalRawHashrate              Decimal   @default(0) @db.Decimal(18, 8)
+  totalEffectiveHashrate        Decimal   @default(0) @db.Decimal(18, 8)
+  totalNetworkPermanentHashrate Decimal   @default(0) @db.Decimal(18, 8)
+  miningSupply                  Decimal   @default(400000000) @db.Decimal(18, 8)
+  totalSupply                   Decimal   @default(1000000000) @db.Decimal(18, 8)
+  remainingSupply               Decimal   @default(400000000) @db.Decimal(18, 8)
+  phaseStartTimestamp           DateTime  @default(now())
+  phaseMinedTokens              Decimal   @default(0) @db.Decimal(18, 8)
+  tgeCompleted                  Boolean   @default(false)
+  tgeTimestamp                  DateTime?
+  tokenMintAddress              String?
+  treasuryAddress               String?
+}
+
+model MarketplaceBid {
+  id               String           @id
+  listingId        String
+  bidderId         String
+  amount           Decimal          @db.Decimal(18, 8)
+  status           String           @default("PENDING")
+  createdAt        DateTime         @default(now())
+  frozenAmount     Decimal          @default(0) @db.Decimal(18, 9)
+  User             User             @relation(fields: [bidderId], references: [id])
+  BoostMarketplace BoostMarketplace @relation(fields: [listingId], references: [id], onDelete: Cascade)
+
+  @@index([bidderId])
+  @@index([listingId])
+  @@index([status])
+}
+
+model MiningVault {
+  id             String    @id
+  phaseNumber    Int       @unique
+  totalTokens    Decimal   @default(20000000) @db.Decimal(18, 8)
+  releasedTokens Decimal   @default(0) @db.Decimal(18, 8)
+  isActive       Boolean   @default(false)
+  activatedAt    DateTime?
+
+  @@index([isActive])
+  @@index([phaseNumber])
+}
+
+model PlatformRevenue {
+  id        String   @id
+  source    String
+  amount    Decimal  @db.Decimal(18, 9)
+  currency  String   @default("SOL")
+  listingId String?
+  metadata  String?
+  createdAt DateTime @default(now())
+}
+
+model Referral {
+  id                            String   @id
+  inviterId                     String
+  invitedId                     String   @unique
+  createdAt                     DateTime @default(now())
+  User_Referral_invitedIdToUser User     @relation("Referral_invitedIdToUser", fields: [invitedId], references: [id], onDelete: Cascade)
+  User_Referral_inviterIdToUser User     @relation("Referral_inviterIdToUser", fields: [inviterId], references: [id], onDelete: Cascade)
+
+  @@index([invitedId])
+  @@index([inviterId])
+}
+
+model SolDeposit {
+  id          String   @id
+  userId      String
+  txSignature String   @unique
+  amount      Decimal  @db.Decimal(18, 9)
+  status      String   @default("CONFIRMED")
+  createdAt   DateTime @default(now())
+  User        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([txSignature])
+  @@index([userId])
+}
+
+model SolWithdrawal {
+  id          String   @id
+  userId      String
+  toAddress   String
+  amount      Decimal  @db.Decimal(18, 9)
+  fee         Decimal  @default(0) @db.Decimal(18, 9)
+  txSignature String?
+  status      String   @default("PENDING")
+  createdAt   DateTime @default(now())
+  User        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Transaction {
+  id             String          @id
+  txHash         String          @unique
+  previousTxHash String?
+  blockNumber    Int             @unique
+  userId         String
+  type           TransactionType
+  amount         Decimal         @db.Decimal(18, 8)
+  signatureHash  String
+  createdAt      DateTime        @default(now())
+  balanceAfter   Decimal         @db.Decimal(18, 9)
+  balanceBefore  Decimal         @db.Decimal(18, 9)
+  mid            String
+  relatedBoostId String?
+  relatedRoundId String?
+  relatedUserMid String?
+  metadata       Json?
+  User           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([blockNumber])
+  @@index([createdAt])
+  @@index([type])
+  @@index([userId])
+  @@index([mid])
+  @@index([relatedBoostId])
+  @@index([relatedRoundId])
+  @@index([relatedUserMid])
+}
+
+model Transfer {
+  id                             String   @id
+  senderId                       String
+  receiverId                     String
+  amount                         Decimal  @db.Decimal(18, 8)
+  createdAt                      DateTime @default(now())
+  User_Transfer_receiverIdToUser User     @relation("Transfer_receiverIdToUser", fields: [receiverId], references: [id])
+  User_Transfer_senderIdToUser   User     @relation("Transfer_senderIdToUser", fields: [senderId], references: [id])
+
+  @@index([receiverId])
+  @@index([senderId])
+}
+
+model User {
+  id                                               String             @id
+  telegramId                                       BigInt             @unique
+  username                                         String?
+  firstName                                        String
+  lastName                                         String?
+  photoUrl                                         String?
+  balance                                          Decimal            @default(0) @db.Decimal(18, 8)
+  referralCode                                     String             @unique
+  referredBy                                       String?
+  createdAt                                        DateTime           @default(now())
+  updatedAt                                        DateTime
+  walletAddress                                    String?
+  encryptedPrivKey                                 String?
+  miningId                                         String             @unique
+  unclaimedTokens                                  Decimal            @default(0) @db.Decimal(18, 8)
+  totalMined                                       Decimal            @default(0) @db.Decimal(18, 8)
+  lastMiningUpdate                                 DateTime           @default(now())
+  rawHashrate                                      Decimal            @default(10) @db.Decimal(18, 8)
+  effectiveHashrate                                Decimal            @default(10) @db.Decimal(18, 8)
+  displayName                                      String             @unique
+  baseHashrate                                     Decimal            @default(10) @db.Decimal(18, 8)
+  purchasedHashrate                                Decimal            @default(0) @db.Decimal(18, 8)
+  referralHashrate                                 Decimal            @default(0) @db.Decimal(18, 8)
+  temporaryHashrate                                Decimal            @default(0) @db.Decimal(18, 8)
+  activeMultiplier                                 Decimal            @default(1) @db.Decimal(18, 8)
+  multiplierExpiresAt                              DateTime?
+  tradingWalletAddress                             String?
+  tradingWalletEncryptedKey                        String?
+  solBalance                                       Decimal            @default(0) @db.Decimal(18, 9)
+  frozenSol                                        Decimal            @default(0) @db.Decimal(18, 9)
+  convertedToOnChain                               Decimal            @default(0) @db.Decimal(18, 8)
+  lastLoginDate                                    DateTime?
+  lastStreakClaimAt                                DateTime?
+  loginStreak                                      Int                @default(0)
+  miningStartedAt                                  DateTime?
+  avatarCustomUrl                                  String?
+  avatarPixelData                                  Json?
+  avatarType                                       String             @default("default")
+  avatarUnlockedAt                                 DateTime?
+  isElite                                          Boolean            @default(false)
+  availableBalance                                 Decimal            @default(0) @db.Decimal(18, 8)
+  lockedBalance                                    Decimal            @default(0) @db.Decimal(18, 8)
+  BoostMarketplace_BoostMarketplace_buyerIdToUser  BoostMarketplace[] @relation("BoostMarketplace_buyerIdToUser")
+  BoostMarketplace_BoostMarketplace_sellerIdToUser BoostMarketplace[] @relation("BoostMarketplace_sellerIdToUser")
+  MarketplaceBid                                   MarketplaceBid[]
+  predictionBets                                   PredictionBet[]
+  Referral_Referral_invitedIdToUser                Referral?          @relation("Referral_invitedIdToUser")
+  Referral_Referral_inviterIdToUser                Referral[]         @relation("Referral_inviterIdToUser")
+  SolDeposit                                       SolDeposit[]
+  SolWithdrawal                                    SolWithdrawal[]
+  Transaction                                      Transaction[]
+  Transfer_Transfer_receiverIdToUser               Transfer[]         @relation("Transfer_receiverIdToUser")
+  Transfer_Transfer_senderIdToUser                 Transfer[]         @relation("Transfer_senderIdToUser")
+  User                                             User?              @relation("UserToUser", fields: [referredBy], references: [id])
+  other_User                                       User[]             @relation("UserToUser")
+  UserBoost                                        UserBoost[]
+  UserCoupon                                       UserCoupon[]
+
+  @@index([isElite])
+  @@index([miningId])
+  @@index([referralCode])
+  @@index([referredBy])
+  @@index([telegramId])
+}
+
+model UserBoost {
+  id                 String    @id
+  userId             String
+  boostId            String
+  activeUntil        DateTime?
+  createdAt          DateTime  @default(now())
+  source             String    @default("SHOP")
+  paymentTxSignature String?
+  Boost              Boost     @relation(fields: [boostId], references: [id])
+  User               User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([activeUntil])
+  @@index([boostId])
+  @@index([userId])
+}
+
+model UserCoupon {
+  id         String    @id
+  userId     String
+  multiplier Decimal   @db.Decimal(18, 8)
+  duration   Int
+  source     String    @default("REFERRAL")
+  usedAt     DateTime?
+  createdAt  DateTime  @default(now())
+  User       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([usedAt])
+  @@index([userId])
+}
+
+model PredictionRound {
+  id               String           @id @default(cuid())
+  roundNumber      Int              @unique @default(autoincrement())
+  asset            String
+  status           String
+  bettingStartsAt  DateTime
+  lockAt           DateTime
+  endsAt           DateTime
+  startPrice       Float?
+  endPrice         Float?
+  startTradeId     String?          @map("startOracleRoundId")
+  startTradeAt     DateTime?        @map("startOracleUpdatedAt")
+  endTradeId       String?          @map("endOracleRoundId")
+  endTradeAt       DateTime?        @map("endOracleUpdatedAt")
+  processingWorker String?
+  createdAt        DateTime         @default(now())
+  settled          Boolean          @default(false)
+  settlementTxId   String?
+  settlementStatus String           @default("PENDING")
+  totalLocked      Decimal          @default(0) @db.Decimal(18, 8)
+  upPool           Decimal          @default(0) @db.Decimal(18, 8)
+  downPool         Decimal          @default(0) @db.Decimal(18, 8)
+  betCount         Int              @default(0)
+  bets             PredictionBet[]
+  ticks            PredictionTick[]
+
+  @@index([status, settled])
+  @@index([processingWorker, status, createdAt])
+  @@index([status, lockAt])
+}
+
+model PredictionTick {
+  id        String          @id @default(cuid())
+  roundId   String
+  price     Float
+  tradeId   String          @map("oracleRoundId")
+  timestamp DateTime        @map("updatedAt")
+  index     Int
+  round     PredictionRound @relation(fields: [roundId], references: [id], onDelete: Cascade)
+
+  @@unique([roundId, index])
+  @@index([roundId, index])
+  @@index([roundId, tradeId])
+  @@index([roundId, timestamp])
+}
+
+model PredictionBet {
+  id           String              @id @default(cuid())
+  userId       String
+  roundId      String
+  amount       Decimal             @db.Decimal(18, 8)
+  acceptedAt   DateTime            @default(now())
+  settled      Boolean             @default(false)
+  won          Boolean             @default(false)
+  createdAt    DateTime            @default(now())
+  settledAt    DateTime?
+  direction    PredictionDirection
+  claimable    Boolean             @default(false)
+  claimedAt    DateTime?
+  payoutAmount Decimal             @default(0) @db.Decimal(18, 8)
+  round        PredictionRound     @relation(fields: [roundId], references: [id], onDelete: Cascade)
+  user         User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([roundId])
+  @@index([roundId, acceptedAt])
+  @@index([roundId, settled, acceptedAt])
+  @@index([settled])
+  @@index([userId])
+  @@index([userId, createdAt])
+}
+
+enum MarketplaceStatus {
+  ACTIVE
+  SOLD
+  CANCELLED
+}
+
+enum TransactionType {
+  MINING_CLAIM
+  BOOST_PURCHASE
+  BOOST_SALE
+  TRANSFER_SENT
+  TRANSFER_RECEIVED
+  REFERRAL_BONUS
+  MARKETPLACE_FEE
+  TOKEN_CONVERSION
+  ON_CHAIN_CLAIM
+  SOL_TRANSFER_SENT
+  SOL_TRANSFER_RECEIVED
+  BOOST_TRANSFER_SENT
+  BOOST_TRANSFER_RECEIVED
+  PREDICTION_LOCK
+  PREDICTION_PAYOUT
+  PREDICTION_REFUND
+}
+
+enum PredictionDirection {
+  UP
+  DOWN
+}
