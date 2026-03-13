@@ -15,8 +15,6 @@ export class RoundManager {
   private updateInFlight = false;
   private readonly debugRunId = `round-manager-${process.pid}-${Date.now()}`;
   private updateIteration = 0;
-  private readonly nextTickIndexByRound = new Map<string, number>();
-  private readonly latestTickPriceByRound = new Map<string, number>();
 
   constructor(chainlinkService: ChainlinkService, workerId: string) {
     this.chainlinkService = chainlinkService;
@@ -339,6 +337,14 @@ export class RoundManager {
       endsAt: round.endsAt.toISOString()
     });
 
+    // Seed index=0 as soon as round opens when we already have a snapshot.
+    if (round.startPrice !== null) {
+      await this.insertPeriodicTick(round, {
+        price: round.startPrice,
+        tradeId: round.startTradeId ?? `snapshot-${round.id}-0`,
+        timestamp: round.startTradeAt ?? now
+      });
+    }
   }
 
   private async handleBettingRound(round: PredictionRound): Promise<void> {
@@ -363,6 +369,16 @@ export class RoundManager {
             tradeId: snapshotTrade.tradeId,
             timestamp: snapshotTrade.timestamp.toISOString()
           });
+
+          await this.insertPeriodicTick(
+            {
+              ...round,
+              startPrice: snapshotTrade.price,
+              startTradeId: snapshotTrade.tradeId,
+              startTradeAt: snapshotTrade.timestamp
+            },
+            snapshotTrade
+          );
         } else {
           console.log("ERROR", {
             message: "Missing start price during BETTING; waiting for market snapshot",
@@ -370,6 +386,9 @@ export class RoundManager {
             workerId: this.workerId
           });
         }
+      } else {
+        const trade = this.chainlinkService.consumeRecoveryTrade() ?? this.chainlinkService.getLatestTrade();
+        await this.insertPeriodicTick(round, trade);
       }
       return;
     }
@@ -416,7 +435,6 @@ export class RoundManager {
   private async closeRound(round: PredictionRound): Promise<void> {
     const latestTrade = this.chainlinkService.getLatestTrade();
     const recoveryTrade = this.chainlinkService.consumeRecoveryTrade();
-    // Last LIVE tick before transition to CLOSED.
     await this.insertPeriodicTick(round, latestTrade ?? recoveryTrade ?? null);
 
     const windowStart = new Date(round.endsAt.getTime() - config.twapWindowMs);
@@ -472,8 +490,6 @@ export class RoundManager {
         }
       });
     });
-    this.nextTickIndexByRound.delete(round.id);
-    this.latestTickPriceByRound.delete(round.id);
 
     console.log("ROUND_CLOSED", {
       roundId: round.id,
@@ -489,86 +505,74 @@ export class RoundManager {
     round: PredictionRound,
     trade: ExchangeTradeData | null
   ): Promise<void> {
-    const nextIndex = await this.getNextTickIndex(round.id);
-    const cachedPrice = this.latestTickPriceByRound.get(round.id);
-    const resolvedPrice = trade?.price ?? cachedPrice ?? round.startPrice ?? null;
-    if (resolvedPrice === null) {
-      console.log("ERROR", {
-        message: "Tick insert skipped: no price available",
-        roundId: round.id,
-        workerId: this.workerId
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const latestTick = await prisma.predictionTick.findFirst({
+        where: { roundId: round.id },
+        orderBy: { index: "desc" }
       });
-      return;
-    }
-
-    const resolvedTradeId =
-      trade?.tradeId ?? round.startTradeId ?? `carry-${round.id}-${nextIndex}`;
-    const resolvedTimestamp = trade?.timestamp ?? new Date();
-
-    try {
-      await prisma.predictionTick.create({
-        data: {
+      const nextIndex = latestTick ? latestTick.index + 1 : 0;
+      const resolvedPrice =
+        trade?.price ?? latestTick?.price ?? round.startPrice ?? null;
+      if (resolvedPrice === null) {
+        console.log("ERROR", {
+          message: "Tick insert skipped: no price available",
           roundId: round.id,
+          workerId: this.workerId
+        });
+        return;
+      }
+
+      const resolvedTradeId =
+        trade?.tradeId ??
+        latestTick?.tradeId ??
+        round.startTradeId ??
+        `carry-${round.id}-${nextIndex}`;
+      const resolvedTimestamp = trade?.timestamp ?? new Date();
+
+      try {
+        await prisma.predictionTick.create({
+          data: {
+            roundId: round.id,
+            price: resolvedPrice,
+            tradeId: resolvedTradeId,
+            timestamp: resolvedTimestamp,
+            index: nextIndex
+          }
+        });
+
+        console.log("TICK_INSERTED", {
+          roundId: round.id,
+          workerId: this.workerId,
+          index: nextIndex,
           price: resolvedPrice,
           tradeId: resolvedTradeId,
-          timestamp: resolvedTimestamp,
-          index: nextIndex
+          timestamp: resolvedTimestamp.toISOString(),
+          isRecovery: trade?.isRecovery ?? false
+        });
+        return;
+      } catch (error) {
+        if (
+          error instanceof Prisma.PrismaClientKnownRequestError &&
+          error.code === "P2002"
+        ) {
+          continue;
         }
-      });
 
-      this.nextTickIndexByRound.set(round.id, nextIndex + 1);
-      this.latestTickPriceByRound.set(round.id, resolvedPrice);
-      console.log("TICK_INSERTED", {
-        roundId: round.id,
-        workerId: this.workerId,
-        index: nextIndex,
-        price: resolvedPrice,
-        tradeId: resolvedTradeId,
-        timestamp: resolvedTimestamp.toISOString(),
-        isRecovery: trade?.isRecovery ?? false
-      });
-      if ((nextIndex + 1) % 60 === 0) {
-        console.log("TICK_BATCH_WRITTEN", {
+        console.error("ERROR", {
+          message: "Failed to insert tick",
           roundId: round.id,
-          tickCount: nextIndex + 1
+          tradeId: resolvedTradeId,
+          error
         });
+        return;
       }
-      return;
-    } catch (error) {
-      if (
-        error instanceof Prisma.PrismaClientKnownRequestError &&
-        error.code === "P2002"
-      ) {
-        // Resync cursor on uniqueness collision (e.g. process restart).
-        const latestTick = await prisma.predictionTick.findFirst({
-          where: { roundId: round.id },
-          orderBy: { index: "desc" },
-          select: { index: true }
-        });
-        this.nextTickIndexByRound.set(round.id, (latestTick?.index ?? -1) + 1);
-      }
-      console.error("ERROR", {
-        message: "Failed to insert tick",
-        roundId: round.id,
-        tradeId: resolvedTradeId,
-        error
-      });
     }
-  }
 
-  private async getNextTickIndex(roundId: string): Promise<number> {
-    const existing = this.nextTickIndexByRound.get(roundId);
-    if (existing !== undefined) {
-      return existing;
-    }
-    const latestTick = await prisma.predictionTick.findFirst({
-      where: { roundId },
-      orderBy: { index: "desc" },
-      select: { index: true }
+    console.error("ERROR", {
+      message: "Failed to insert tick after retries",
+      roundId: round.id,
+      tradeId: trade?.tradeId ?? null
     });
-    const nextIndex = (latestTick?.index ?? -1) + 1;
-    this.nextTickIndexByRound.set(roundId, nextIndex);
-    return nextIndex;
   }
 
   private async settleRecoverableRounds(): Promise<void> {
