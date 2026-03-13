@@ -22,7 +22,7 @@ export const config = {
   bettingLockBufferMs: 500,
   liveDurationMs: 60_000,
   transitionToleranceMs: 300,
-  loopIntervalMs: 2_000,
+  loopIntervalMs: 500,
   twapWindowMs: 10_000,
   tokenDecimals: 8
 };
