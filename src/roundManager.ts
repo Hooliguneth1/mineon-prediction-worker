@@ -738,6 +738,7 @@ export class RoundManager {
 
             const roundPoolSum = this.roundDownToTokenPrecision(upPool + downPool);
             const totalLockedRounded = this.roundDownToTokenPrecision(totalLocked);
+            let integrityFallbackToRefundAll = false;
             if (roundPoolSum !== totalLockedRounded) {
               console.error("SETTLEMENT_INTEGRITY_MISMATCH", {
                 roundId,
@@ -748,7 +749,7 @@ export class RoundManager {
                 totalLocked,
                 delta: this.roundDownToTokenPrecision(roundPoolSum - totalLockedRounded)
               });
-              throw new Error("SETTLEMENT_INTEGRITY_MISMATCH_ROUND_POOL");
+              integrityFallbackToRefundAll = true;
             }
 
             const lateBets = await tx.predictionBet.findMany({
@@ -823,10 +824,17 @@ export class RoundManager {
                 totalLocked,
                 delta: this.roundDownToTokenPrecision(settledPartitionTotal - totalLockedRounded)
               });
-              throw new Error("SETTLEMENT_INTEGRITY_MISMATCH_ELIGIBLE_SUM");
+              integrityFallbackToRefundAll = true;
             }
 
-            if (lateBets.length > 0) {
+            if (integrityFallbackToRefundAll) {
+              console.warn("SETTLEMENT_INTEGRITY_FALLBACK_REFUND_ALL", {
+                roundId,
+                settlementTxId
+              });
+            }
+
+            if (!integrityFallbackToRefundAll && lateBets.length > 0) {
               await tx.predictionBet.updateMany({
                 where: {
                   id: {
@@ -843,32 +851,52 @@ export class RoundManager {
               });
             }
 
-        if (bets.length === 0) {
-          await tx.predictionRound.update({
-            where: { id: roundId },
-            data: {
-              settled: true,
-              settlementStatus: "SETTLED"
+            const betsForSettlement = integrityFallbackToRefundAll
+              ? await tx.$queryRaw<
+                  Array<{
+                    id: string;
+                    userId: string;
+                    direction: string;
+                    amount: Prisma.Decimal | number | string;
+                    acceptedAt: Date;
+                  }>
+                >`
+                  SELECT "id", "userId", "direction", "amount", "acceptedAt"
+                  FROM "PredictionBet"
+                  WHERE "roundId" = ${roundId}
+                    AND "settled" = false
+                  FOR UPDATE
+                `
+              : bets;
+
+            eligibleBetCount = betsForSettlement.length;
+
+            if (betsForSettlement.length === 0) {
+              await tx.predictionRound.update({
+                where: { id: roundId },
+                data: {
+                  settled: true,
+                  settlementStatus: "SETTLED"
+                }
+              });
+              console.log("TOTAL_POOL", {
+                roundId,
+                totalWinning: 0,
+                totalLosing: 0
+              });
+              console.log("WINNERS_COUNT", {
+                roundId,
+                winnersCount: 0
+              });
+              return;
             }
-          });
-          console.log("TOTAL_POOL", {
-            roundId,
-            totalWinning: 0,
-            totalLosing: 0
-          });
-          console.log("WINNERS_COUNT", {
-            roundId,
-            winnersCount: 0
-          });
-          return;
-        }
 
             const equalPrice = endPrice === startPrice;
             const winningDirection = endPrice > startPrice ? "UP" : "DOWN";
-        const normalizedBets = bets.map((bet) => ({
-          ...bet,
-          amountNumber: Number(bet.amount)
-        }));
+            const normalizedBets = betsForSettlement.map((bet) => ({
+              ...bet,
+              amountNumber: Number(bet.amount)
+            }));
             const eligibleUpPool = this.roundDownToTokenPrecision(
               normalizedBets
                 .filter((bet) => bet.direction === "UP")
@@ -888,7 +916,7 @@ export class RoundManager {
             const losingBets = equalPrice
               ? []
               : normalizedBets.filter((bet) => bet.direction !== winningDirection);
-            const shouldRefundAll = equalPrice || winnerPool === 0;
+            const shouldRefundAll = integrityFallbackToRefundAll || equalPrice || winnerPool === 0;
 
             console.log("TOTAL_POOL", {
               roundId,
@@ -922,100 +950,114 @@ export class RoundManager {
               .sort(([a], [b]) => a.localeCompare(b));
             payoutUserCount = payoutEntries.length;
 
-        const payoutUserIds = payoutEntries.map(([userId]) => userId);
-        const usersBeforePayout = payoutUserIds.length
-          ? await tx.user.findMany({
-              where: {
-                id: {
-                  in: payoutUserIds
-                }
+            const payoutUserIds = payoutEntries.map(([userId]) => userId);
+            const usersBeforePayout = payoutUserIds.length
+              ? await tx.user.findMany({
+                  where: {
+                    id: {
+                      in: payoutUserIds
+                    }
+                  },
+                  select: {
+                    id: true,
+                    balance: true,
+                    miningId: true
+                  }
+                })
+              : [];
+            const userById = new Map(usersBeforePayout.map((user) => [user.id, user]));
+
+            const latestTransaction = await tx.transaction.findFirst({
+              orderBy: {
+                blockNumber: "desc"
               },
               select: {
-                id: true,
-                balance: true,
-                miningId: true
+                blockNumber: true
               }
-            })
-          : [];
-        const userById = new Map(usersBeforePayout.map((user) => [user.id, user]));
+            });
+            let nextBlockNumber = (latestTransaction?.blockNumber ?? 0) + 1;
 
-        const latestTransaction = await tx.transaction.findFirst({
-          orderBy: {
-            blockNumber: "desc"
-          },
-          select: {
-            blockNumber: true
-          }
-        });
-        let nextBlockNumber = (latestTransaction?.blockNumber ?? 0) + 1;
+            const transactionType = shouldRefundAll
+              ? "PREDICTION_REFUND"
+              : "PREDICTION_PAYOUT";
 
-        const transactionType = shouldRefundAll
-          ? "PREDICTION_REFUND"
-          : "PREDICTION_PAYOUT";
-
-        for (const [userId, payout] of payoutEntries) {
-          if (payout <= 0) {
-            continue;
-          }
-          const userBefore = userById.get(userId);
-          if (!userBefore) {
-            continue;
-          }
-          const roundedPayout = new Prisma.Decimal(
-            payout.toFixed(config.tokenDecimals)
-          );
-          const updatedUser = await tx.user.update({
-            where: { id: userId },
-            data: {
-              balance: {
-                increment: roundedPayout
+            for (const [userId, payout] of payoutEntries) {
+              if (payout <= 0) {
+                continue;
               }
-            },
-            select: {
-              balance: true
+              const userBefore = userById.get(userId);
+              if (!userBefore) {
+                continue;
+              }
+              const roundedPayout = new Prisma.Decimal(
+                payout.toFixed(config.tokenDecimals)
+              );
+              const updatedUser = await tx.user.update({
+                where: { id: userId },
+                data: {
+                  balance: {
+                    increment: roundedPayout
+                  }
+                },
+                select: {
+                  balance: true
+                }
+              });
+
+              await tx.transaction.create({
+                data: {
+                  id: `tx${randomUUID().replace(/-/g, "").slice(0, 24)}`,
+                  txHash: `pred-${settlementTxId}-${nextBlockNumber}`,
+                  previousTxHash: null,
+                  blockNumber: nextBlockNumber,
+                  userId,
+                  type: transactionType,
+                  amount: roundedPayout,
+                  signatureHash: randomUUID().replace(/-/g, ""),
+                  balanceBefore: userBefore.balance,
+                  balanceAfter: updatedUser.balance,
+                  mid: userBefore.miningId,
+                  relatedBoostId: null,
+                  relatedRoundId: roundId,
+                  relatedUserMid: null,
+                  metadata: {
+                    settlementTxId,
+                    roundId,
+                    mode: shouldRefundAll ? "REFUND" : "PAYOUT"
+                  }
+                }
+              });
+
+              nextBlockNumber += 1;
             }
-          });
-
-          await tx.transaction.create({
-            data: {
-              id: `tx${randomUUID().replace(/-/g, "").slice(0, 24)}`,
-              txHash: `pred-${settlementTxId}-${nextBlockNumber}`,
-              previousTxHash: null,
-              blockNumber: nextBlockNumber,
-              userId,
-              type: transactionType,
-              amount: roundedPayout,
-              signatureHash: randomUUID().replace(/-/g, ""),
-              balanceBefore: userBefore.balance,
-              balanceAfter: updatedUser.balance,
-              mid: userBefore.miningId,
-              relatedBoostId: null,
-              relatedRoundId: roundId,
-              relatedUserMid: null,
-              metadata: {
-                settlementTxId,
-                roundId,
-                mode: shouldRefundAll ? "REFUND" : "PAYOUT"
-              }
-            }
-          });
-
-          nextBlockNumber += 1;
-        }
 
             if (shouldRefundAll) {
-              await tx.$executeRaw`
-                UPDATE "PredictionBet"
-                SET
-                  "settled" = true,
-                  "won" = false,
-                  "settledAt" = NOW(),
-                  "claimable" = false,
-                  "payoutAmount" = "amount"
-                WHERE "roundId" = ${roundId}
-                  AND "settled" = false
-                  AND "acceptedAt" < ${round.lockAt}
-              `;
+              if (integrityFallbackToRefundAll) {
+                await tx.$executeRaw`
+                  UPDATE "PredictionBet"
+                  SET
+                    "settled" = true,
+                    "won" = false,
+                    "settledAt" = NOW(),
+                    "claimable" = false,
+                    "payoutAmount" = "amount"
+                  WHERE "roundId" = ${roundId}
+                    AND "settled" = false
+                `;
+              } else {
+                await tx.$executeRaw`
+                  UPDATE "PredictionBet"
+                  SET
+                    "settled" = true,
+                    "won" = false,
+                    "settledAt" = NOW(),
+                    "claimable" = false,
+                    "payoutAmount" = "amount"
+                  WHERE "roundId" = ${roundId}
+                    AND "settled" = false
+                    AND "acceptedAt" < ${round.lockAt}
+                `;
+              }
               console.log("WINNERS_COUNT", {
                 roundId,
                 winnersCount: normalizedBets.length
