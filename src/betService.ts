@@ -52,16 +52,19 @@ export async function placeBetServerAuthoritative(
         const balanceUpdate = await tx.user.updateMany({
           where: {
             id: input.userId,
+            balance: {
+              gte: amount
+            },
             availableBalance: {
               gte: amount
             }
           },
           data: {
-            availableBalance: {
+            balance: {
               decrement: amount
             },
-            lockedBalance: {
-              increment: amount
+            availableBalance: {
+              decrement: amount
             }
           }
         });

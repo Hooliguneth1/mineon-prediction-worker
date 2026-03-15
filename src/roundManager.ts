@@ -762,6 +762,7 @@ export class RoundManager {
               },
               select: {
                 id: true,
+                userId: true,
                 amount: true,
                 acceptedAt: true
               }
@@ -897,6 +898,23 @@ export class RoundManager {
               ...bet,
               amountNumber: Number(bet.amount)
             }));
+            const settledStakeByUser = new Map<string, number>();
+            const accumulateSettledStake = (userId: string, amount: number): void => {
+              settledStakeByUser.set(
+                userId,
+                this.roundDownToTokenPrecision(
+                  (settledStakeByUser.get(userId) ?? 0) + amount
+                )
+              );
+            };
+            for (const bet of normalizedBets) {
+              accumulateSettledStake(bet.userId, bet.amountNumber);
+            }
+            if (!integrityFallbackToRefundAll) {
+              for (const lateBet of lateBets) {
+                accumulateSettledStake(lateBet.userId, this.toNumber(lateBet.amount));
+              }
+            }
             const eligibleUpPool = this.roundDownToTokenPrecision(
               normalizedBets
                 .filter((bet) => bet.direction === "UP")
@@ -997,6 +1015,9 @@ export class RoundManager {
                 data: {
                   balance: {
                     increment: roundedPayout
+                  },
+                  availableBalance: {
+                    increment: roundedPayout
                   }
                 },
                 select: {
@@ -1029,6 +1050,20 @@ export class RoundManager {
               });
 
               nextBlockNumber += 1;
+            }
+
+            for (const [userId, settledStake] of settledStakeByUser.entries()) {
+              if (settledStake <= 0) {
+                continue;
+              }
+              await tx.$executeRaw`
+                UPDATE "User"
+                SET "lockedBalance" = GREATEST(
+                  "lockedBalance" - ${new Prisma.Decimal(settledStake.toFixed(config.tokenDecimals))},
+                  0
+                )
+                WHERE "id" = ${userId}
+              `;
             }
 
             if (shouldRefundAll) {
