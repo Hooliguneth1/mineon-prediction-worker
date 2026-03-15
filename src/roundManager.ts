@@ -464,9 +464,13 @@ export class RoundManager {
       return;
     }
 
+    // Use updateMany with status guard so that if closeRound is re-entered for a
+    // round that was already closed (e.g. recovery path racing the direct path),
+    // count === 0 and we skip creating a duplicate BETTING round.
+    let didClose = false;
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      await tx.predictionRound.update({
-        where: { id: round.id },
+      const closed = await tx.predictionRound.updateMany({
+        where: { id: round.id, status: "LIVE" },
         data: {
           status: "CLOSED",
           endPrice,
@@ -474,6 +478,13 @@ export class RoundManager {
           endTradeAt: latestTrade?.timestamp ?? null
         }
       });
+
+      if (closed.count === 0) {
+        // Already closed by a concurrent path — do not spawn another BETTING round.
+        return;
+      }
+
+      didClose = true;
 
       const now = new Date();
       const lockAt = new Date(now.getTime() + config.bettingDurationMs);
@@ -491,13 +502,17 @@ export class RoundManager {
       });
     });
 
-    console.log("ROUND_CLOSED", {
-      roundId: round.id,
-      workerId: this.workerId,
-      endPrice,
-      twapWindowSeconds: config.twapWindowMs / 1000
-    });
+    if (didClose) {
+      console.log("ROUND_CLOSED", {
+        roundId: round.id,
+        workerId: this.workerId,
+        endPrice,
+        twapWindowSeconds: config.twapWindowMs / 1000
+      });
+    }
 
+    // Always attempt settlement regardless of whether this call performed the close.
+    // settleRound has its own idempotency guard (PENDING → PROCESSING → SETTLED claim).
     await this.settleRound(round.id);
   }
 
@@ -736,21 +751,13 @@ export class RoundManager {
             }
             didClaim = true;
 
-            const roundPoolSum = this.roundDownToTokenPrecision(upPool + downPool);
-            const totalLockedRounded = this.roundDownToTokenPrecision(totalLocked);
+            // Check 1 (upPool + downPool == totalLocked) has been intentionally removed.
+            // upPool/downPool are denormalized counters added via runtime ALTER TABLE migration.
+            // Existing rounds that had bets placed before those columns existed will show
+            // upPool=0 / downPool=0 with a non-zero totalLocked, causing a false integrity
+            // mismatch and an incorrect refund-all.  Check 2 below (sum of actual bet rows
+            // vs totalLocked) is the authoritative and correct validation.
             let integrityFallbackToRefundAll = false;
-            if (roundPoolSum !== totalLockedRounded) {
-              console.error("SETTLEMENT_INTEGRITY_MISMATCH", {
-                roundId,
-                settlementTxId,
-                check: "upPool_plus_downPool_equals_totalLocked",
-                upPool,
-                downPool,
-                totalLocked,
-                delta: this.roundDownToTokenPrecision(roundPoolSum - totalLockedRounded)
-              });
-              integrityFallbackToRefundAll = true;
-            }
 
             const lateBets = await tx.predictionBet.findMany({
               where: {
@@ -808,22 +815,18 @@ export class RoundManager {
                 AND "acceptedAt" < ${round.lockAt}
             `;
             const eligibleAmountSum = this.toNumber(eligibleSumRaw[0]?.sum ?? 0);
-            const eligibleAmountSumRounded = this.roundDownToTokenPrecision(eligibleAmountSum);
-            const lateAmountSum = this.roundDownToTokenPrecision(
-              lateBets.reduce((sum, bet) => sum + this.toNumber(bet.amount), 0)
-            );
-            const settledPartitionTotal = this.roundDownToTokenPrecision(
-              eligibleAmountSumRounded + lateAmountSum
-            );
-            if (settledPartitionTotal !== totalLockedRounded) {
+            const lateAmountSumRaw = lateBets.reduce((sum, bet) => sum + this.toNumber(bet.amount), 0);
+            const rawPartitionTotal = eligibleAmountSum + lateAmountSumRaw;
+            const partitionTolerance = 1 / (10 ** config.tokenDecimals);
+            if (Math.abs(rawPartitionTotal - totalLocked) > partitionTolerance) {
               console.error("SETTLEMENT_INTEGRITY_MISMATCH", {
                 roundId,
                 settlementTxId,
                 check: "sum_unsettled_eligible_plus_late_equals_totalLocked",
                 eligibleAmountSum,
-                lateAmountSum,
+                lateAmountSumRaw,
                 totalLocked,
-                delta: this.roundDownToTokenPrecision(settledPartitionTotal - totalLockedRounded)
+                delta: rawPartitionTotal - totalLocked
               });
               integrityFallbackToRefundAll = true;
             }
@@ -892,39 +895,19 @@ export class RoundManager {
               return;
             }
 
-            const equalPrice = endPrice === startPrice;
+            const PRICE_EPSILON = 1e-8;
+            const equalPrice = Math.abs(endPrice - startPrice) < PRICE_EPSILON;
             const winningDirection = endPrice > startPrice ? "UP" : "DOWN";
             const normalizedBets = betsForSettlement.map((bet) => ({
               ...bet,
               amountNumber: Number(bet.amount)
             }));
-            const settledStakeByUser = new Map<string, number>();
-            const accumulateSettledStake = (userId: string, amount: number): void => {
-              settledStakeByUser.set(
-                userId,
-                this.roundDownToTokenPrecision(
-                  (settledStakeByUser.get(userId) ?? 0) + amount
-                )
-              );
-            };
-            for (const bet of normalizedBets) {
-              accumulateSettledStake(bet.userId, bet.amountNumber);
-            }
-            if (!integrityFallbackToRefundAll) {
-              for (const lateBet of lateBets) {
-                accumulateSettledStake(lateBet.userId, this.toNumber(lateBet.amount));
-              }
-            }
-            const eligibleUpPool = this.roundDownToTokenPrecision(
-              normalizedBets
-                .filter((bet) => bet.direction === "UP")
-                .reduce((sum, bet) => sum + bet.amountNumber, 0)
-            );
-            const eligibleDownPool = this.roundDownToTokenPrecision(
-              normalizedBets
-                .filter((bet) => bet.direction === "DOWN")
-                .reduce((sum, bet) => sum + bet.amountNumber, 0)
-            );
+            const eligibleUpPool = normalizedBets
+              .filter((bet) => bet.direction === "UP")
+              .reduce((sum, bet) => sum + bet.amountNumber, 0);
+            const eligibleDownPool = normalizedBets
+              .filter((bet) => bet.direction === "DOWN")
+              .reduce((sum, bet) => sum + bet.amountNumber, 0);
             const winnerPool = winningDirection === "UP" ? eligibleUpPool : eligibleDownPool;
             const loserPool = winningDirection === "UP" ? eligibleDownPool : eligibleUpPool;
 
@@ -1050,20 +1033,6 @@ export class RoundManager {
               });
 
               nextBlockNumber += 1;
-            }
-
-            for (const [userId, settledStake] of settledStakeByUser.entries()) {
-              if (settledStake <= 0) {
-                continue;
-              }
-              await tx.$executeRaw`
-                UPDATE "User"
-                SET "lockedBalance" = GREATEST(
-                  "lockedBalance" - ${new Prisma.Decimal(settledStake.toFixed(config.tokenDecimals))},
-                  0
-                )
-                WHERE "id" = ${userId}
-              `;
             }
 
             if (shouldRefundAll) {

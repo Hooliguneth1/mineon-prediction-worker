@@ -14,14 +14,24 @@ export class InsufficientAvailableBalanceError extends Error {
   }
 }
 
+// P2034: write conflict or deadlock under Serializable isolation — safe to retry.
+function isSerializationError(error: unknown): boolean {
+  return (error as { code?: string })?.code === "P2034";
+}
+
+const MAX_BET_PLACEMENT_ATTEMPTS = 3;
+
 export async function placeBetServerAuthoritative(
   prisma: PrismaClient,
   input: NewBetInput,
   nowProvider: () => Date = () => new Date()
 ): Promise<PredictionBet> {
-  try {
-    return await prisma.$transaction(
-      async (tx) => {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < MAX_BET_PLACEMENT_ATTEMPTS; attempt += 1) {
+    try {
+      return await prisma.$transaction(
+        async (tx) => {
         const amount = new Prisma.Decimal(input.amount.toFixed(8));
         const round = await tx.predictionRound.findUnique({
           where: { id: input.roundId },
@@ -41,8 +51,7 @@ export async function placeBetServerAuthoritative(
             id: true,
             miningId: true,
             balance: true,
-            availableBalance: true,
-            lockedBalance: true
+            availableBalance: true
           }
         });
         if (!userBefore) {
@@ -76,8 +85,7 @@ export async function placeBetServerAuthoritative(
           where: { id: input.userId },
           select: {
             balance: true,
-            availableBalance: true,
-            lockedBalance: true
+            availableBalance: true
           }
         });
         if (!userAfter) {
@@ -145,9 +153,7 @@ export async function placeBetServerAuthoritative(
               betId: bet.id,
               direction: input.direction,
               availableBalanceBefore: userBefore.availableBalance.toString(),
-              availableBalanceAfter: userAfter.availableBalance.toString(),
-              lockedBalanceBefore: userBefore.lockedBalance.toString(),
-              lockedBalanceAfter: userAfter.lockedBalance.toString()
+              availableBalanceAfter: userAfter.availableBalance.toString()
             }
           }
         });
@@ -162,14 +168,31 @@ export async function placeBetServerAuthoritative(
       },
       { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
     );
-  } catch (error) {
-    if (error instanceof BettingLockedError) {
-      console.log("BET_REJECTED_LOCKED", {
-        roundId: error.roundId,
-        now: error.now.toISOString(),
-        cutoffAt: error.cutoffAt.toISOString()
-      });
+    } catch (error) {
+      lastError = error;
+
+      if (error instanceof BettingLockedError) {
+        console.log("BET_REJECTED_LOCKED", {
+          roundId: error.roundId,
+          now: error.now.toISOString(),
+          cutoffAt: error.cutoffAt.toISOString()
+        });
+        throw error;
+      }
+
+      if (isSerializationError(error) && attempt < MAX_BET_PLACEMENT_ATTEMPTS - 1) {
+        console.log("BET_PLACEMENT_SERIALIZATION_RETRY", {
+          roundId: input.roundId,
+          userId: input.userId,
+          attempt: attempt + 1
+        });
+        continue;
+      }
+
+      throw error;
     }
-    throw error;
   }
+
+  // Exhausted all retries on serialization conflicts — surface as a clean spend error.
+  throw lastError;
 }
