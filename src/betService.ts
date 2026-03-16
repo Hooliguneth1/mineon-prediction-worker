@@ -14,6 +14,14 @@ export class InsufficientAvailableBalanceError extends Error {
   }
 }
 
+export class OppositeSideBetNotAllowedError extends Error {
+  readonly code = "BET_OPPOSITE_SIDE_NOT_ALLOWED";
+
+  constructor(roundId: string, userId: string) {
+    super(`User ${userId} already has an opposite-side bet in round ${roundId}`);
+  }
+}
+
 // P2034: write conflict or deadlock under Serializable isolation — safe to retry.
 function isSerializationError(error: unknown): boolean {
   return (error as { code?: string })?.code === "P2034";
@@ -44,6 +52,29 @@ export async function placeBetServerAuthoritative(
 
         const now = nowProvider();
         assertBettingOpenOrThrow(round.id, round.lockAt, now);
+
+        // Per-user/round transactional lock to prevent opposite-side race conditions.
+        await tx.$executeRaw`
+          SELECT pg_advisory_xact_lock(hashtext(${`prediction-bet:${round.id}:${input.userId}`}))
+        `;
+
+        const oppositeSideBet = await tx.predictionBet.findFirst({
+          where: {
+            roundId: round.id,
+            userId: input.userId,
+            settled: false,
+            direction: {
+              not: input.direction
+            }
+          },
+          select: {
+            id: true,
+            direction: true
+          }
+        });
+        if (oppositeSideBet) {
+          throw new OppositeSideBetNotAllowedError(round.id, input.userId);
+        }
 
         const userBefore = await tx.user.findUnique({
           where: { id: input.userId },
@@ -176,6 +207,15 @@ export async function placeBetServerAuthoritative(
           roundId: error.roundId,
           now: error.now.toISOString(),
           cutoffAt: error.cutoffAt.toISOString()
+        });
+        throw error;
+      }
+      if (error instanceof OppositeSideBetNotAllowedError) {
+        console.log("BET_REJECTED_OPPOSITE_SIDE", {
+          roundId: input.roundId,
+          userId: input.userId,
+          direction: input.direction,
+          code: error.code
         });
         throw error;
       }
